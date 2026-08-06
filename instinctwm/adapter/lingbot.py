@@ -61,6 +61,7 @@ class LingBotSurface:
         self._cross_sites: dict = {}
         self._mod_sites: dict = {}
         self._sched_sites: dict = {}
+        self._attn_sites: dict = {}
         self._server = server
 
     # -- WHERE ------------------------------------------------------------------------------
@@ -108,6 +109,49 @@ class LingBotSurface:
                     yield Site(kind=kind, id=f"lingbot.kv_ring[{i}]",
                                attrs={"addressing": "ring_interval",
                                       "scope": Scope.CYCLE, "evaluated_at": Scope.LAYER})
+        elif kind is SiteKind.ATTENTION_OP:
+            # `attn_op` is an INSTANCE attribute assigned in WanAttention.__init__
+            # (model.py:302-303 picks custom_sdpa for attn_mode='torch'), so it is directly
+            # replaceable per layer without touching the class.
+            self._install_attn_shim()
+            for i, b in enumerate(blocks):
+                a = b.attn1
+                op = getattr(a, "attn_op", None)
+                if op is None:
+                    continue
+                sid = f"lingbot.attention[{i}]"
+                self._attn_sites[sid] = a
+                pool = (getattr(a, "attn_caches", None) or {}).get(self.cache_name) or {}
+                k = pool.get("k")
+                ring = pool.get("_ring")
+                yield Site(
+                    kind=kind, id=sid,
+                    attrs={
+                        "op": op,
+                        "heads": a.heads,
+                        "head_dim": (k.shape[3] if k is not None
+                                     else a.inner_dim // a.heads),
+                        "dtype": k.dtype if k is not None else None,
+                        "layout": "bshd",
+                        # custom_sdpa passes NO mask and NO is_causal (model.py:37-40). A pass
+                        # that would only be legal for an unmasked call needs to know that, and
+                        # must not have to read the model to find out.
+                        "masked": False,
+                        "capacity": (k.shape[1] if k is not None else None),
+                        # Observed at trace time. The two phases have different query extents
+                        # (240 video / 32 action rows at batch 2) and a pass measuring on the
+                        # wrong one measures the wrong thing.
+                        "q_rows": getattr(a, "_iwm_last_q_rows", None),
+                        "batch": getattr(a, "_iwm_last_batch", None),
+                        # HOW the live set reaches the op today. "sliced" means its extent is in
+                        # a tensor shape, which is what lands in a capture key.
+                        "extent_binding": "sliced",
+                        "extent": (lambda _r=ring: (_r["start"], _r["count"])) if ring else None,
+                        "pool": (lambda _p=pool: (_p.get("k"), _p.get("v"))) if k is not None
+                                else None,
+                        "note": "self-attention over the ring KV pool; model.py:444-455",
+                    })
+
         elif kind is SiteKind.ALLOCATION:
             self._install_alloc_shim()
             for i, b in enumerate(blocks):
@@ -342,6 +386,44 @@ class LingBotSurface:
         SchedCls.set_timesteps = set_timesteps
         SchedCls._iwm_step_shim = True
 
+    # -- attention plumbing ------------------------------------------------------------------
+
+    def _install_attn_shim(self):
+        """Interpose one recording wrapper, and give a pass a slot to replace UNDER it.
+
+        Three layers, on purpose:
+
+            attn_op            the recording wrapper -- installed once, never replaced
+            _iwm_attn_impl     what actually computes -- this is what a rewrite swaps
+            _iwm_attn_base     the model's own op, kept so a rewrite can fall back to it
+
+        Wrapping `attn_op` directly would work exactly once: the second pass to run would wrap the
+        first pass's wrapper and the recorded shapes would stop being the model's. Recording is the
+        adapter's business and stays outermost; the pass owns only the inner slot.
+
+        Recording is one-shot per layer. Two phases with different query extents both get seen
+        because the FIRST call of each shape wins per attribute, and a pass that needs both asks
+        for the site twice -- once per phase -- rather than the adapter guessing.
+        """
+        for b in getattr(self.model, "blocks", []) or []:
+            a = b.attn1
+            if getattr(a, "_iwm_attn_shim", False):
+                continue
+            base = a.attn_op
+            a._iwm_attn_base = base
+            a._iwm_attn_impl = base
+
+            def recording(q, k, v, _a=a):
+                if _a._iwm_last_q_rows is None:
+                    _a._iwm_last_q_rows = int(q.shape[1])
+                    _a._iwm_last_batch = int(q.shape[0])
+                return _a._iwm_attn_impl(q, k, v)
+
+            a._iwm_last_q_rows = None
+            a._iwm_last_batch = None
+            a.attn_op = recording
+            a._iwm_attn_shim = True
+
     # -- modulation combine plumbing ---------------------------------------------------------
 
     @staticmethod
@@ -365,11 +447,25 @@ class LingBotSurface:
             return
         from einops import rearrange
 
+        # Shared with the stock body and with hoist_invariant_casts; see runtime/fused_residual.py.
+        # Unarmed it is the eager expression, so this shim's numerics are unchanged.
+        from instinctwm.runtime.fused_residual import RESIDUAL
+
         def default_combine(self_b, temb):
             self_b._iwm_last_temb_elems = temb.numel()
             return self_b.scale_shift_table[None] + temb.float()
 
         _orig = Blk.forward
+        if not getattr(_orig, "_iwm_calls_residual", False):
+            # The un-rewritten fallback below delegates to whatever was installed before this
+            # shim. If that is the STOCK upstream body it contains the residual expression
+            # inline, so a kernel armed on the hook would reach the rewritten path and not the
+            # fallback — the fusion would apply or not depending on whether an unrelated pass
+            # happened to fire. Substitute the hooked copy of the stock body, which is
+            # byte-for-byte identical apart from the hook. Another InstinctWM body already
+            # carries the marker and is left alone.
+            from instinctwm.runtime.fused_residual import _block_forward_hooked
+            _orig = _block_forward_hooked
 
         def forward(self_b, hidden_states, encoder_hidden_states, temb, rotary_emb,
                     update_cache=0, cache_name="pos"):
@@ -390,8 +486,7 @@ class LingBotSurface:
             attn_output = self_b.attn1(norm_hidden_states, norm_hidden_states, norm_hidden_states,
                                        rotary_emb, update_cache=update_cache,
                                        cache_name=cache_name)
-            hidden_states = (hidden_states.float()
-                             + attn_output * gate_msa).type_as(hidden_states)
+            hidden_states = RESIDUAL(hidden_states, attn_output, gate_msa)
             norm_hidden_states = self_b.norm2(hidden_states.float()).type_as(hidden_states)
             attn_output = self_b.attn2(norm_hidden_states, encoder_hidden_states,
                                        encoder_hidden_states, None, update_cache=0,
@@ -400,9 +495,9 @@ class LingBotSurface:
             norm_hidden_states = (self_b.norm3(hidden_states.float()) * (1. + c_scale_msa)
                                   + c_shift_msa).type_as(hidden_states)
             ff_output = self_b.ffn(norm_hidden_states)
-            return (hidden_states.float()
-                    + ff_output.float() * c_gate_msa).type_as(hidden_states)
+            return RESIDUAL(hidden_states, ff_output, c_gate_msa)
 
+        forward._iwm_calls_residual = True
         Blk.forward = forward
         Blk._iwm_default_combine = default_combine
         Blk._iwm_modulate_shim = True
@@ -505,6 +600,12 @@ class LingBotSurface:
 
         if rewrite.site_id == "lingbot.block_stack" and rewrite.kind is RewriteKind.WRAP:
             self._wrapped["block_stack"] = rewrite.payload(self._raw_stack)
+            return
+        if rewrite.site_id.startswith("lingbot.attention[") and rewrite.kind is RewriteKind.WRAP:
+            a = self._attn_sites[rewrite.site_id]
+            # Replace the INNER slot. The recording wrapper stays outermost, so a second pass
+            # still sees the model's shapes rather than this pass's wrapper.
+            a._iwm_attn_impl = rewrite.payload(a._iwm_attn_impl)
             return
         if rewrite.site_id.startswith("lingbot.kv_pool[") and rewrite.kind is RewriteKind.WRAP:
             a = self._alloc_sites[rewrite.site_id]

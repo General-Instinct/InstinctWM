@@ -1,0 +1,49 @@
+# --- the vLLM-Omni comparison arm --------------------------------------------
+# This is env.sh's IWM_OMNI_PY (.venv-omni). It exists only to run serve_omni_arm.py, the
+# external reference arm that measures a shipped third-party optimization against ours.
+#
+# A THIRD LOCK, FOR THE SAME REASON THERE IS A SECOND ONE.
+# server-requirements.in is pinned to lingbot-va/requirements.txt exactly, because the served
+# baseline has to be the upstream one. vllm-omni cannot live there:
+#
+#   * vllm-omni >= 0.22 pins `diffusers==0.38.0`; the server pins 0.36.0. Only 0.20.0 accepts
+#     0.36, and 0.20.0 does not contain PromptEmbedCache -- so no single version both satisfies
+#     the server's pins and carries the component under test.
+#   * `import vllm_omni` requires `vllm`, an UNDECLARED dependency (absent from vllm-omni's
+#     requires_dist, yet vllm_omni/model_executor/models/registry.py:1 imports it), and vllm
+#     pins `torch==2.11.0` against the server's 2.9.0.
+#
+# Changing either would change served numerics, and RESULTS.md's appendix records the cost: a
+# diffusers change reroutes autoencoder_kl_wan and invalidates the 91.6% baseline. So this arm
+# gets its own environment and talks over the websocket, exactly as the RoboTwin client
+# (torch 2.4) already coexists with the server (torch 2.9). See env.sh: "Never try to merge
+# these."
+#
+# CONSEQUENCE FOR MEASUREMENT: because the stack differs, absolute ms from this arm are NOT
+# comparable to arms run under IWM_SERVER_PY. Only the within-env delta (D_base - D) is.
+# run_omni_arm.sh measures both of its arms here so that cannot be violated by accident.
+#
+# Regenerate the lock after editing:
+#   uv pip compile omni-arm-requirements.in --python-version 3.10 -o omni-arm-requirements.txt
+
+vllm-omni==0.26.0
+vllm
+
+# The LingBot-VA server's own runtime needs, deliberately UNPINNED: this environment is not
+# trying to reproduce the server's pins, it is letting vllm-omni resolve freely and then hosting
+# the server on whatever that produces. It works -- the server runs unmodified on
+# transformers 5.x / numpy 2.x / diffusers 0.38.
+transformers
+accelerate
+einops
+easydict
+tqdm
+imageio[ffmpeg]
+websockets
+msgpack
+opencv-python
+matplotlib
+ftfy
+safetensors
+Pillow
+numpy

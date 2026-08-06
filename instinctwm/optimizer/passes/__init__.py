@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from instinctwm.optimizer.passes.cfg_elision import CFGBranchElision
 from instinctwm.optimizer.passes.conditioning_prefill import ConditioningPrefill
+from instinctwm.optimizer.passes.operator_fusion import OperatorFusion
 from instinctwm.optimizer.passes.substrate import (
     AllocatorChurnElision,
     DebugDumpElision,
@@ -35,6 +36,10 @@ def default_passes() -> "list[OptimizationPass]":
         ObsDecodeElision(),
         ConditioningPrefill(),
         CFGBranchElision(),
+        # Last: it is the only pass that rewrites the block body, and it composes with the two
+        # other rewrites by detecting them rather than by ordering. Evaluating it last keeps
+        # `explain()` reading in layer order (substrate -> graph -> cache -> kernel).
+        OperatorFusion(),
     ]
 
 
@@ -45,5 +50,6 @@ __all__ = [
     "DebugDumpElision",
     "FSDPElision",
     "ObsDecodeElision",
+    "OperatorFusion",
     "default_passes",
 ]

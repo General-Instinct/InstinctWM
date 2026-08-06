@@ -29,6 +29,10 @@ from pathlib import Path
 TESTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TESTS_DIR.parent
 MISSING_RE = re.compile(r"No module named '([^']+)'")
+#: Evidence that the file got far enough to RUN tests, in either convention: `ok test_x` /
+#: `FAIL test_x` from the function-style runner, and the indented `OK  ` / `FAIL` markers the
+#: script-style files print per assertion.
+RAN_RE = re.compile(r"^(?:ok|FAIL)\s+test_\w|^\s+(?:OK|FAIL)\s", re.M)
 
 
 def run_module_tests(namespace: dict) -> int:
@@ -65,7 +69,14 @@ def classify(proc: subprocess.CompletedProcess) -> tuple[str, str]:
         root = mod.split(".")[0]
         if root == "instinctwm":
             return "FAIL", f"cannot import {mod} — the repo cannot import itself"
-        return "SKIP", f"needs {root}"
+        # A missing third-party module is a SKIP only if it stopped the file from running at
+        # all. If tests EXECUTED and some failed, the failure is real and must be reported --
+        # otherwise one test that touches the lingbot tree hides every other failure in the
+        # file behind a reassuring "needs modules". That is not hypothetical: it hid a genuine
+        # `install_plan` regression, which read as a skip for as long as nobody ran the file
+        # directly.
+        if not RAN_RE.search(proc.stdout or ""):
+            return "SKIP", f"needs {root}"
     tail = (proc.stderr or proc.stdout or "").strip().splitlines()
     return "FAIL", tail[-1] if tail else f"exit {proc.returncode}"
 

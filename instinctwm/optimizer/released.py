@@ -47,14 +47,20 @@ RELEASED = (
               "removing 7,110 casts of a constant per control cycle. Cost model predicted 47.4 ms, "
               "measured 49.7 ms (6% error)"),
     Released(
-        pid="P005", name="graph_block_stack", version="1.0.0", tier=Tier.BITEXACT,
+        pid="P005", name="graph_block_stack", version="1.0.1", tier=Tier.BITEXACT,
         step_speedup=1.38,
         gates="max|delta action| = 0 over 6 paired seeded cycles, verified with the gate run AFTER "
               "an episode reset (the ordering that exposed a nan); 2539.9 -> 1842.0 ms under "
               "probe_latency --repeats 3, spread 0.5%. Runs the 30-block stack from a captured "
               "CUDA graph: per-op dispatch 6.2 us (83.6% of it cudaLaunchKernel) becomes ~1.17 us "
               "replay. Requires P003, whose slice addressing is what makes the stack capturable "
-              "at all -- a stock block raises cudaErrorStreamCaptureInvalidated"),
+              "at all -- a stock block raises cudaErrorStreamCaptureInvalidated. "
+              "v1.0.1 (correctness): the eager fallback taken when capture FAILS did not call "
+              "_commit_all, so from the first failure onwards the ring stopped advancing and "
+              "attention read a frozen KV window -- plausible, silent, wrong actions. Found when "
+              "a 50-task certification run OOMed at 64 held graphs and degraded to eager. The "
+              "measured timings below are unaffected: they were taken on runs where capture "
+              "never failed, and the fix adds nothing to the replay path"),
     Released(
         pid="P006", name="stable_state_pools", version="1.0.0", tier=Tier.BITEXACT,
         step_speedup=1.52,

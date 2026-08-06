@@ -366,3 +366,307 @@ shape. Not chased further, because 0.5% of a cycle cannot justify it.
 A first pass apportioned GPU time by bytes and was wrong: 5.92 GB over 183.3 ms is 32 GB/s, ~100x
 under HBM, which is precisely the signal that these copies are overhead-bound rather than
 bandwidth-bound.
+
+---
+
+# 10. L5 operator fusion — measured at three scales, and rejected at the one that counts (2026-08-05)
+
+The kernel layer (`instinctwm/kernels/`) had no caller until now: regions were declared, kernels
+registered themselves, and nothing outside `tests/` imported either. `OperatorFusion` connects it
+to a plan, and `--fuse-residual` puts it on the serving path. This section is what that bought.
+
+**Recommendation: keep it opt-in. Do not add `--fuse-residual` to the shipped chain.**
+
+## What was fused
+
+`(hidden.float() + x * gate).type_as(hidden)`, the block's two gated residuals — the
+self-attention one (`model.py:543-544`) and the feed-forward one (`:563-564`). Pure elementwise,
+no reduction, so it is the one declared region where BITEXACT is reachable. 3 eager kernels -> 1.
+
+## Three measurements, two of which are encouraging and irrelevant
+
+| scale | what was measured | result |
+|---|---|---|
+| region, python launch | the expression alone, in a python loop | 0.73x–1.79x, size-dependent |
+| region, cuda-graph replay | the same, device time only | **3.0x–7.6x** |
+| one real block, graph replay | `WanTransformerBlock`, interleaved A/B | **1.033x**, `torch.equal` |
+| **full control cycle** | **shipped chain + `--graph-blocks`, ABBA** | **0.994x** |
+
+Region and block level say ship it. The cycle says otherwise, and the cycle is the number.
+
+## The end-to-end result
+
+8 measurements per arm, alternating ABBA, a **fresh server for every measurement** on the same
+GPU, chains differing by exactly one entry.
+
+| arm | mean | median | stdev | min | max |
+|---|---|---|---|---|---|
+| shipped chain | 3198.8 ms | 3198.9 ms | 17.0 | 3169.7 | 3216.4 |
+| + `--fuse-residual` | 3217.0 ms | 3215.2 ms | 16.4 | 3197.5 | 3241.9 |
+
+**0.994x — a 0.57% regression, t ≈ 2.2, borderline.** Paired per-measurement deltas are +14.0,
++40.8, +26.2, −8.3 ms: three of four against the fusion, one for it. The honest reading is *no
+gain, plausibly a small loss* — not a clean regression, and nowhere near the ~3% the block-level
+measurement predicts.
+
+The fusion was verifiably running. `RESIDUAL.report()` on every reset:
+`fused=34560 below_threshold=0 bypassed=0` — every residual site took the kernel, zero fallbacks.
+This is not a treatment arm that failed to fire.
+
+## Two confounds that produced wrong answers first, recorded so they are not repeated
+
+1. **Order bias.** The first design ran base then fusion every round. The box drifts *upward*
+   across a session — 3214 → 3730 → 3964 ms over three rounds — so "second" is systematically
+   slower, and the treatment arm was always second. ABBA fixes it.
+2. **Allocator carry-over.** `--no-empty-cache` means the caching allocator never returns
+   anything and each server sits at **81 GB on an 80 GB card**. Reusing a server across
+   measurements carries that state forward; the first attempt showed 46–52% spread between kept
+   runs and `probe_latency` correctly refused to quote it. A fresh server per measurement brings
+   within-measurement spread to 0.2–0.5%.
+
+A third, at block level: timing stock, then hooked, then armed *in that order* reported 1.24x for
+a configuration where the kernel had not been armed at all (`fused=0`). The whole difference was
+the A100 boosting its clocks during the ~2,000 warm-up launches in between. Interleave, or do not
+measure.
+
+## Why the block-level win does not survive
+
+Not established. What is established is that it does not, and the gap is large enough that the
+region-level break-even sweep the installer runs is **not predictive of the cycle**. That is a gap
+in this integration, not a property of this kernel: `optimizer/contract.py` says the performance
+gate is `harness.cycle_ms_before/after`, and the installer gates on a region microbenchmark
+instead. The region sweep is the right instrument for *which shapes*, and the wrong one for
+*whether at all*.
+
+The block-level probe also ran with a nearly-empty KV pool, where attention is cheap and the
+residual is a larger share of the block. The server runs a pool that grows 272 tokens per cycle.
+That direction is consistent with the gap but does not account for its size, so it is a
+hypothesis, not the finding.
+
+## What stays
+
+The pass, the kernel, the hook and the flag all stay. `OperatorFusion` remains in
+`default_passes()`, where it is self-gating: without `--graph-blocks` the break-even lands at
+1,966,080 elements, above both stream shapes, so `plan.serve()` arms nothing. The measurement is
+here so that "fuse the elementwise residuals" is not proposed a third time without a cycle-level
+gate attached to it.
+
+---
+
+# 11. L4 attention — the KV extent is worth five times the attention (2026-08-06)
+
+Layer 4 had no code before this. Two candidates were implemented and measured end to end: picking
+the SDPA backend by measurement, and moving the KV extent out of the CUDA graph capture key. The
+result that matters is not about attention speed.
+
+**Recommendation: `--ring-attention` is worth a certificate and does not yet have one.
+`--attention-backend` is rejected. Do not add either to the shipped chain today.**
+
+## READ THIS FIRST: the substrate changed
+
+Every number in sections 1-10 was measured on 8x H100 with `/home/ubuntu/.venv-lingbot`. **This
+section was measured on 8x A100-SXM4-80GB**, and that venv no longer exists, so `.venv-server`
+(torch 2.9.0+cu128) was used instead. Nothing here is comparable to an earlier section, and
+nothing here reproduces one. These are new baselines on a different box.
+
+The A100 baseline for the shipped default stack, `probe_latency --repeats 4`:
+
+| run | cycle | state |
+|---|---|---|
+| 1 | 3165.7 ms | capturing |
+| 2 | 2164.4 ms | warm |
+| 3 | 2169.3 ms | warm |
+
+The tool refuses to quote a steady-state mean (spread 46%), and it is right to: the two states are
+1000 ms apart and the protocol mixes them. Warm is ~2167 ms/cycle = 67.7 ms/control step = 14.8 Hz.
+
+## Attention is 3.6% of GPU busy, and the README's "7%" had no source
+
+`profile_cycle.py`, one cycle, P001+P002 configuration:
+
+| category | ms | % of GPU | launches |
+|---|---|---|---|
+| GEMM | 2250.0 | 39.8% | 46,605 |
+| gather/copy | 1926.3 | 34.1% | 195,232 |
+| elementwise/norm | 904.0 | 16.0% | 139,963 |
+| other | 338.7 | 6.0% | 51,981 |
+| **attention** | **201.5** | **3.6%** | 4,742 |
+| memcpy | 36.4 | 0.6% | 19,579 |
+
+4,742 launches is 30 layers x 79 forwards x 2, which confirms the attribution. Two limits: this is
+the P001+P002 rung, so `gather/copy` still contains the mask-and-gather P003 removes; and it
+profiles cycle 5, where the ring holds ~760 slots. Attention cost is linear in the ring extent
+(microbenchmarked on this box: 110 ms/cycle at count=1000 rising to 684 ms at a full 9792 pool), so
+any single-number share is a statement about one point in an episode. **The direction of the
+finding survives that caveat: attention arithmetic is not where the time is.**
+
+## Plan A: choose the SDPA backend by measurement — REJECTED
+
+`F.scaled_dot_product_attention` dispatches by heuristic, not by measuring the shapes in front of
+it. On the served shapes it picks flash, and cuDNN is faster. `AttentionBackend` measures every
+backend on the site's own shapes and installs the winner. Measured by the pass itself, on the real
+server, at half a pool:
+
+```
+shape (2, 240, 24, 128, 9792, bfloat16): incumbent 0.231 ms -> cudnn 0.193 ms (1.20x) [NUMERIC]
+    flash          0.231 ms   max|d| vs incumbent 0.000e+00   <- what the dispatcher picks
+    cudnn          0.193 ms   max|d| vs incumbent 4.883e-04
+    mem_efficient  0.347 ms
+    math           3.822 ms
+```
+
+End to end, sequential A/B on one GPU, warm runs only:
+
+| | baseline | + `--attention-backend` |
+|---|---|---|
+| warm run 2 | 2171.8 ms | 2166.7 ms |
+| warm run 3 | 2184.8 ms | 2159.1 ms |
+
+**-15.4 ms/cycle, 0.7%** — and the within-arm spread is 13 ms, so this sits at the edge of the
+protocol's resolution. Direction is consistent (the variant is faster in both warm runs and in the
+capturing run) but the magnitude should not be quoted to three digits.
+
+The cost side is not marginal:
+
+```
+probe_bitexact, 6 paired seeded cycles
+  max|delta action|                   1.367
+  reference chunk-to-chunk movement   1.055
+  ratio                               129.6%     VERDICT: NOT bit-exact
+```
+
+A 4.883e-04 per-call difference compounds through the KV cache, because the actions it helps
+produce are written back into the pool the next cycle reads. Six cycles in, the divergence exceeds
+the signal. **0.7% does not buy a paired non-inferiority run**, which costs ~10x the GPU time of
+measuring the speedup. The pass and its gates stay in the tree so this is not proposed again.
+
+An earlier draft of this section claimed 1.49x for the backend swap. That came from an
+under-sampled probe and does not reproduce; 1.20-1.21x is the figure that does.
+
+## Plan B: the KV extent leaves the capture key
+
+`graph_block_stack` keys every graph on `(start, count)` because the live KV set reaches attention
+as a **slice**, and a slice puts its length in a tensor shape. Shapes are frozen at capture. The
+ring advances 272 slots/cycle and `start` stays 0 for a whole episode, so `count` grows every cycle
+and the key never converges. Server logs show it directly:
+
+```
+capture #1   key=(..., (0, 0))
+capture #3   key=(..., (0, 240))
+capture #119 key=(..., (0, 2448))
+```
+
+`kernels/ring_attention.py` is a Triton kernel taking `(q, k_pool, v_pool, extent)` where the pool
+keeps its full capacity shape and `extent` is a device-resident int32[2]. Three things leak `count`
+into a graph and all three had to be closed together: the read extent (a shape -> the kernel), the
+write offset (a Python slice -> `index_copy_` at a device-computed index), and the key itself
+(`_iwm_ring_signature` -> `None`).
+
+The correctness argument is the masked-tile identity: a tile whose every position is masked
+contributes `m <- max(m, -inf) = m`, `alpha = exp(0) = 1.0`, `l += 0`, `acc += 0` — all exact float
+identities. `tests/test_ring_attention.py` gates it at zero across counts, pool capacities, and
+garbage past the extent, and replays **one captured graph at two different extents** bit-identically.
+
+`probe_episode.py`, 45 cycles, one reset, sequential arms on one GPU:
+
+| | baseline | + `--ring-attention` |
+|---|---|---|
+| whole episode | 3463.0 ms | **2633.0 ms (1.32x)** |
+| late episode (36+) | 3801.1 ms | **2822.4 ms (1.35x)** |
+| captures / cycle | 6.0 | **0.1** |
+| unique graph keys | 270 | **6** |
+| evictions | 204 | **0** |
+| cache hit rate | 92.457% | **99.831%** |
+| late-episode spread | 0.6% | **0.2%** |
+
+Six keys is exactly 2 token shapes x 3 `update_cache` values — the whole key space once the ring is
+gone. The late-episode -978.7 ms lands within 5% of the -1032 ms predicted from 6 captures x 172 ms,
+which is the evidence that the mechanism is the intended one and not a coincidence.
+
+**A single capture costs 172.0 ms** on this box (n=120, range 162.8-220.4). The earlier estimate in
+`graph_capture.py` was ~275 ms on H100.
+
+Tier: NUMERIC. `probe_bitexact` gives `max|delta action| = 1.184` against a 1.055 reference
+movement, 112%. Same compounding mechanism as Plan A — but here it buys 830 ms/cycle rather than
+15, which is why this one is worth the certificate and that one is not.
+
+## A correctness bug in P005, found by an OOM (fixed, v1.0.1)
+
+`install` sets `_iwm_defer_commit = True` permanently, so `WanAttention.forward` stops committing
+inline and the only thing that advances the ring is `_commit_all`. Both of `stack_graphed`'s
+fallback returns skipped it. **From the first capture failure onwards the ring froze**: `count`
+stopped growing, every later forward rewrote the same slots, and attention read a stale window. No
+exception, no log line; the only symptom is a task success rate that drifts.
+
+Capture failure is advertised as a safe degradation, and this was the one path where "safe" meant
+"silently incorrect". Found because a 50-task certification run OOMed at `held=64 evicted=400` and
+degraded to eager on all 8 servers. Fixed by routing both fallbacks through a `_eager()` helper
+that runs the stack and then commits. The timings in sections 8-10 are unaffected — they were taken
+on runs where capture never failed, and the fix adds nothing to the replay path.
+
+## Graph eviction does not return its memory, and lowering the cap makes it worse
+
+Evicting a captured graph does not give its private memory pool back. Over a 50-task run the
+teacher servers climbed from 24 GB to the 80 GB ceiling and every one of the 8 OOMed.
+`IWM_MAX_GRAPHS` was added to bound it and **the experiment falsified the idea**: at a cap of 32,
+
+```
+gpu0: captures=523 replays=20881 held=32 evicted=461  fallbacks=1
+```
+
+461 evictions for 523 captures, and all 8 servers OOMed anyway. Capping the *held* set lower does
+not help when the leak is in *eviction* — it only increases the eviction count. The knob stays,
+defaulting to 64, but it is not the fix.
+
+The consequences went past latency. One A100 entered `GPU requires reset` and was lost for the rest
+of the session. The `--ring-attention` arm, which holds 6 graphs and evicts none, ran the same
+workload at a flat 41-42 GB with zero fallbacks. **The cost of a non-converging capture key is not
+830 ms/cycle; it is that the shipped default cannot finish a 50-task evaluation on this box.**
+
+## The certification is NOT complete, and the first teacher arm was void
+
+Margin `-0.02` was declared before the run and 50 tasks x 10 episodes was chosen because the README
+records the 2/2-step student clearing its margin on a 10-task subset and failing at 50.
+
+**The student arm is complete and valid**: 500/500 episodes, 50/50 tasks, 0.904 success. All 8
+servers reported `captures=12 held=6 evicted=0 fallbacks=0` over 342,291 replays, at a flat
+41-42 GB. It took 2h05m.
+
+**The first teacher arm is void and must not be used.** It emitted 355 episodes over 49 tasks, with
+**23 tasks truncated** — `place_a2b_right` 1/10, `shake_bottle` 1/10, `stamp_seal` 2/10. Every one
+of those clients exited `rc=0`; the truncation is silent.
+
+The reason it is void is not the missing count, it is the **direction** of the missing. Episodes
+that completed are the ones that ran fastest, and episode duration correlates with outcome (a
+success often terminates early, a failure runs to the step limit). So the teacher lost
+disproportionately many failures, which is exactly what its impossible-looking 0.955 against the
+student's 0.904 reflects. Certifying against it would have systematically penalised the student
+while every automated check passed. The data is retained at `l4ring_teacher_VOID_truncated/`.
+
+**No certificate exists yet.** The teacher arm was restarted without `--graph-blocks` — legitimate
+because graph capture is gated at `max|delta action| = 0`, so the teacher's *actions* are identical
+with or without it, and dropping it removes the entire memory-exhaustion failure chain. That re-run
+was stopped before completion.
+
+## What is in the tree
+
+| | |
+|---|---|
+| `passes/attention_backend.py` | Plan A, on the generic site interface. Rejected by measurement; kept so it is not re-proposed |
+| `passes/interface.py` | `SiteKind.ATTENTION_OP` — the first site that carries the pool and the extent separately |
+| `kernels/ring_attention.py` | Plan B's Triton kernel, 8 gate groups |
+| `runtime/ring_attention_install.py` | Plan B on the serving path, layered on frozen P003 |
+| `--attention-backend`, `--ring-attention` | opt-in flags, neither in the shipped chain |
+
+## What is owed
+
+1. A completed teacher arm and a certificate. Nothing about `--ring-attention` may be called
+   accuracy-neutral until then.
+2. A PTX assertion for the attention kernel. `matches_reference_contraction=False` is currently a
+   declaration, not an assertion, which is the gap `test_triton_residual.py:test_ptx` exists to close
+   for the residual kernel.
+3. A fix for the eviction leak, or a reason it cannot be fixed. `--ring-attention` sidesteps it by
+   never evicting; the default path still has it.
+4. Split-K for the video phase. The kernel wins 1.4-1.8x on the action stream and loses 6-13% on
+   the video stream, because 32 query rows over 24 heads at batch 2 is only 48 programs at
+   BLOCK_M=64, under half this box's 108 SMs.

@@ -138,3 +138,37 @@ would otherwise shadow the real package.
 | `check_prompt_parity.py` | **the gate** — live T5 vs baked training embedding |
 | `run_eval.sh` | fan tasks over GPUs, one serial worker per GPU, records provenance |
 | `aggregate.py` | honest scoring; prints `REPORTABLE: NO` rather than a partial number |
+| `serve_omni_arm.py` | external reference arm: stock server + vLLM-Omni's `PromptEmbedCache` |
+| `run_omni_arm.sh` | builds `.venv-omni` and measures both of its arms — never one alone |
+| `omni-arm-requirements.{in,txt}` | that arm's own lock; deliberately NOT merged with `server-requirements` |
+| `probe_encode_prompt.py` | ceiling for any cache keyed at `encode_prompt`, implementation-independent |
+
+## Comparing against an external stack
+
+Every speedup here is measured against the *unoptimized upstream server*. That is a weak
+baseline — it still pays world_size=1 FSDP, a per-chunk `empty_cache`, and a blocking D2H debug
+dump. `serve_omni_arm.py` answers the obvious follow-up ("how does this compare to a competent
+serving stack?") by holding model, checkpoint and message order fixed and swapping exactly one
+component for the shipped third-party equivalent.
+
+```bash
+./run_omni_arm.sh build     # .venv-omni from its own lock, ~8.3 GB, once
+./run_omni_arm.sh reset     # where this cache actually acts: MISS ~98 ms vs HIT ~4 ms
+./run_omni_arm.sh cycle     # control-cycle mean: no difference, and that is the result
+```
+
+Three rules that make the comparison mean anything, all enforced by the script:
+
+- **Both arms are measured in `.venv-omni`.** Its stack differs from `$IWM_SERVER_PY`, so
+  subtracting an absolute ms here from an absolute ms there measures the torch version, not the
+  optimization. Only the within-env delta is quotable.
+- **`bypassed` must be 0.** `PromptEmbedCache` silently bypasses on any unhashable argument — a
+  run with a climbing `bypassed` measured the *uncached* path while looking like it worked.
+- **The cache acts on `reset`, not on the cycle.** `probe_latency`'s full-cycle mean excludes the
+  reset, so `cycle` showing nothing is expected, not a bug.
+
+Measured 2026-08-04 on 8x A100-80GB: the cache works correctly and saves ~95 ms per hit, once per
+episode; `conditioning_prefill` saves 288 ms per *cycle*. At 10 cycles that is ~30x, and in a
+real eval the instruction is re-sampled per episode so the cache misses and saves nothing. The
+two are not competitors — a generic framework caches at the *request* boundary, and closed-loop
+control has no request boundary, only a 77-forward loop with the constant inside it.

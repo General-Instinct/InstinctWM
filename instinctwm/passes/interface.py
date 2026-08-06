@@ -37,6 +37,10 @@ boolean-mask gather with a ring slice) needs more than "wrap this callable" -- i
 expose the addressing decision itself. `SiteKind.STATE_ADDRESSING` names that need; it does not yet
 satisfy it. Being explicit about the gap is the point: the interface should make the next
 optimization naturally generic, not retroactively claim the last four were.
+
+`SiteKind.ATTENTION_OP` closes part of that gap rather than only naming it: it carries the pool and
+the live extent as SEPARATE attributes, so a pass may ask for `(pool, extent)` instead of a
+pre-sliced tensor. That is one addressing decision made rewritable, not the general case.
 """
 
 from __future__ import annotations
@@ -57,6 +61,12 @@ class SiteKind(Enum):
     INVARIANT_CONDITIONING = "invariant_conditioning"
     #: where state is located -- how a live set is addressed, not where it is stored
     STATE_ADDRESSING = "state_addressing"
+    #: the attention call itself: which callable computes it, over which live extent, at which
+    #: shapes. Distinct from STATE_ADDRESSING, which says how the live set is FOUND: this says how
+    #: it REACHES the op. The distinction is load-bearing, because a live set delivered as a
+    #: SLICE puts its extent in a tensor shape, and a shape is frozen at graph-capture time. The
+    #: same live set delivered as (pool, extent) puts it in a value, which is not.
+    ATTENTION_OP = "attention_op"
     #: where device buffers are created, so their lifetime can be moved
     ALLOCATION = "allocation"
     #: a binary combine where one operand is widened before the op. Which operand gets widened is

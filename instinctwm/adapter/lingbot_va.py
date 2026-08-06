@@ -18,6 +18,7 @@ from instinctwm.adapter.base import (
     AdapterSpec, CommitMode, GuidanceMode, GuidanceRule, KVLifetime, KVStreamSpec,
     PhaseSpec, PurityKey,
 )
+from instinctwm.kernels.lingbot_regions import lingbot_fusion_descriptor
 
 # --- geometry, from wan_va/configs/va_robotwin_cfg.py --------------------------------------
 _HEIGHT, _WIDTH = 256, 320
@@ -112,6 +113,12 @@ def lingbot_va_spec() -> AdapterSpec:
         # The predicted video is never consumed by the RoboTwin client — it asks only for
         # actions. `_infer` returns latents that the caller drops (wan_va_server.py:623-624).
         obs_decode_modules=("vae.decoder",),
+
+        # The block's two fusible op sequences, read out of `modules/model.py:515-566`. Facts
+        # about what the eager path materialises, not a request to fuse anything: `OperatorFusion`
+        # reads them, and the LayerNorm inside `pre_attention_modulated_norm` is what keeps that
+        # region out of the BITEXACT tier for every kernel registered so far.
+        fusion=lingbot_fusion_descriptor(),
 
         notes={
             "attn_mode": "torch (custom_sdpa); forced by the server and by transformer/config.json",

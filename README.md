@@ -23,13 +23,18 @@ optimization down to hardware deployment. You describe the model once in a Backe
 InstinctWM determines which optimizations are legal, applies them, and reports what each one cost.
 
 > **Status: early.** The evaluation pipeline, the measurement tooling, and the graph and cache
-> layers are real and reproducible. The kernel and hardware layers are designed and being built.
+> layers are real and reproducible. The kernel layer now runs end to end — and its first fusion
+> was rejected by that measurement. The hardware layer is designed and being built.
 > Every number here is measured on our own hardware with the scripts in [`eval/`](eval/).
 
 ---
 
 ## What's New 🔥
 
+- **[2026/08]** Kernel layer wired to the plan and the serving path. Its first fusion is
+  **3.0–7.6× on the region, 1.033× on a real block, and 0.994× on the control cycle** — bit-exact
+  throughout, and rejected anyway. A region microbenchmark is not a performance gate.
+  [Three scales, and the two confounds that got it wrong first →](eval/lingbot_va_robotwin/RESULTS.md)
 - **[2026/08]** Step-allocation response surface mapped over 7 operating points, 3500 paired
   episodes, 50 tasks. The shipped LingBot-VA checkpoint sustains **3 video / 3 action steps at
   4.79× with no retraining** — 0.910 vs a 0.926 teacher, passing non-inferiority at a −0.05 margin.
@@ -51,7 +56,7 @@ Six layers, ordered by *what they change* — from the model itself down to the 
 | **MODEL** | **GRAPH** | **CACHE** | **ATTENTION** | **KERNEL** | **HARDWARE** |
 |:--|:--|:--|:--|:--|:--|
 | *what it computes* | *when work is issued* | *what is recomputed* | *how tokens mix* | *how a kernel is written* | *what it executes on* |
-| Step Reduction | **Prefill Extraction** | **KV Reuse** | FlashAttention | **Operator Fusion** | TensorRT |
+| Step Reduction | **Prefill Extraction** | **KV Reuse** | FlashAttention | ~~Gated-Residual Fusion~~ | TensorRT |
 | Parallel Decoding Distillation | **Execution Graph Rewrite** | **Cross-Attention Cache** | FlashInfer | *Fused AdaLN* | FP8 |
 | rCM | **CUDA Graph Capture** | **Episode Cache** | Sana-Video Hybrid | *Triton Kernels* | INT8 |
 | sCM | **Persistent State Analysis** | TeaCache | LongSana | Fused CFG | INT4 |
@@ -67,6 +72,13 @@ path · ~~struck~~ rejected *by measurement*, kept so it is not re-proposed · p
 unbuilt or, in the case of attention, deprioritized *by profile* — it is 7% of GPU busy, the item
 intuition picks first and the measurement ranks near-last. Per-pass measurements, protocols, and the
 full chain are in [Results](eval/lingbot_va_robotwin/RESULTS.md).
+
+KERNEL is now built and connected — an adapter declares fusible regions, the optimizer derives what
+tier a fusion can claim, and the installer picks a kernel by measurement. Its first fusion still
+contributes nothing: bit-exact and 3.0–7.6× on the region under graph replay, 1.033× on a real
+block, **0.994× on the control cycle**. It is struck above because the cycle is the number, and
+kept because a layer whose first honest answer is *no* is worth more than one that has not been
+asked. [The three scales →](eval/lingbot_va_robotwin/RESULTS.md)
 
 ---
 

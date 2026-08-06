@@ -56,11 +56,42 @@ export LINGBOT_CKPT=${LINGBOT_CKPT:-/home/ubuntu/ckpt_lingbot/lingbot-va-posttra
 export IWM_SERVER_PY=${IWM_SERVER_PY:-/home/ubuntu/.venv-lingbot/bin/python}
 export IWM_CLIENT_PY=${IWM_CLIENT_PY:-${ROBOTWIN_ROOT}/.venv/bin/python}
 
+# On a box that HAS the hand-rolled venv the line above wins and nothing below fires, so
+# the frozen numbers keep their substrate. On a box that does not have it -- a fresh clone,
+# or this one -- fall back to the lock-built env rather than dying on a missing interpreter.
+#
+# This is NOT the migration the block above defers. The migration is about which env is
+# AUTHORITATIVE for a published number, and it still needs the probe_bitexact /
+# probe_episode parity run against .venv-lingbot before the default may change. This is
+# only about being runnable where .venv-lingbot does not exist and cannot be rebuilt.
+# It announces itself on every source precisely so a number measured here is never
+# mistaken for a reproduction -- silence is what commit abe41f5 was guarding against, not
+# the fallback itself.
+if [ ! -x "$IWM_SERVER_PY" ] && [ -x "${IWM_ROOT}/.venv-server/bin/python" ]; then
+  export IWM_SERVER_PY="${IWM_ROOT}/.venv-server/bin/python"
+  echo "NOTE: /home/ubuntu/.venv-lingbot is absent; IWM_SERVER_PY falls back to" >&2
+  echo "      \$IWM_ROOT/.venv-server (built from server-requirements.txt)." >&2
+  echo "      This is a DIFFERENT substrate from the one RESULTS.md was measured on." >&2
+  echo "      Numbers from here are a new baseline, not a reproduction." >&2
+fi
+
 if [ ! -x "$IWM_SERVER_PY" ]; then
   echo "WARNING: IWM_SERVER_PY does not exist: $IWM_SERVER_PY" >&2
   echo "         run './scripts/task.sh test-lingbot' from $IWM_ROOT, or see the" >&2
   echo "         build command in $(basename "${BASH_SOURCE[0]}")" >&2
 fi
+
+# ---- third interpreter: the vLLM-Omni comparison arm ------------------------
+# A THIRD env, for the same reason there are already two: it is dependency-incompatible with
+# the other two and the websocket is the seam. vllm-omni pulls diffusers 0.38 / torch 2.11,
+# the server pins diffusers 0.36 / torch 2.9. Built from its OWN lock next to this file
+# (omni-arm-requirements.in -> .txt), never merged into server-requirements.
+#
+# It exists ONLY to run serve_omni_arm.py as an external reference arm. Because its stack
+# differs, absolute ms from it are NOT comparable to arms measured under IWM_SERVER_PY --
+# only the within-env delta is. run_omni_arm.sh enforces that by measuring both of its arms
+# here. Build it with:  ./run_omni_arm.sh build
+export IWM_OMNI_PY=${IWM_OMNI_PY:-${IWM_ROOT}/.venv-omni/bin/python}
 
 # ---- flash-attn import shim -------------------------------------------------
 # wan_va/modules/model.py imports flash_attn unconditionally at module scope even

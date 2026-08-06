@@ -11,9 +11,18 @@ chosen after seeing the delta is a narrative, not a gate.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+from pathlib import Path
 
-sys.path.insert(0, "/home/ubuntu/InstinctWM")
+# Repo root from this file, not written down. The hardcoded "/home/ubuntu/InstinctWM" this
+# replaces has not existed since the tree moved to /home/ubuntu/Code/InstinctWM; it only kept
+# working because `instinctwm` happened to resolve some other way, and it would have failed as
+# an import error at the END of a multi-hour certification run. serve_variant.py carries the
+# same note for the same reason.
+IWM_ROOT = os.environ.get("IWM_ROOT") or str(Path(__file__).resolve().parents[2])
+if IWM_ROOT not in sys.path:
+    sys.path.insert(0, IWM_ROOT)
 
 from instinctwm.certify import NotCertifiable, certify, load_jsonl
 

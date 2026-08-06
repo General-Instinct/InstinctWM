@@ -213,12 +213,32 @@ class _NoopTextEmbedder(torch.nn.Module):
 
 # --- plan installation ------------------------------------------------------------------
 
+def install_operator_fusion(server_module, va_server_cls=None, *,
+                            graph_captured: bool = False) -> list[str]:
+    """Route the block's two gated residuals through a measured Triton kernel.
+
+    Thin on purpose: the work is in `runtime/fused_residual.py`, which both this and the A/B
+    harness call, so a measured speedup cannot come from a different patch than production
+    installs. It raises if the kernel is not bit-exact or does not beat eager anywhere.
+
+    `graph_captured` decides WHICH measurement gates the install, and it is not a detail: a
+    Triton kernel pays ~41 us of Python launcher per call that graph replay erases entirely, so
+    the same kernel measures 0.73x in one mode and 3.27x in the other at the action stream's
+    shape. Pass it from whether the block stack is being captured, never from a default.
+    """
+    from instinctwm.runtime.fused_residual import install_gated_residual_fusion
+
+    return install_gated_residual_fusion(server_module, va_server_cls,
+                                         graph_captured=graph_captured)
+
+
 #: pass name -> installer. Every entry here changes the running server.
 INSTALLERS: dict[str, Callable[..., list[str]]] = {
     "fsdp_elision": install_fsdp_elision,
     "allocator_churn_elision": install_allocator_churn_elision,
     "debug_dump_elision": install_debug_dump_elision,
     "conditioning_prefill": install_conditioning_prefill,
+    "operator_fusion": install_operator_fusion,
 }
 
 #: pass name -> why this backend needs no runtime action for it. Separate from INSTALLERS on

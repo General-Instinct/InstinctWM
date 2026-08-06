@@ -65,6 +65,12 @@ class HoistInvariantCasts:
     def install(self, server_module, server_cls) -> list[str]:
         import modules.model as M
 
+        # The two gated residuals below go through the shared hook rather than being written
+        # out again. With no kernel armed `RESIDUAL` *is* the eager expression, so this changes
+        # nothing here; it is what lets `operator_fusion` reach this body instead of silently
+        # applying to only whichever block rewrite happened to install last.
+        from instinctwm.runtime.fused_residual import RESIDUAL
+
         applied = []
 
         # --- 1. FP32LayerNorm: cache the fp32 parameter views -----------------------------------
@@ -121,8 +127,7 @@ class HoistInvariantCasts:
                                   + shift_msa).type_as(hidden_states)
             attn_output = self.attn1(norm_hidden_states, norm_hidden_states, norm_hidden_states,
                                      rotary_emb, update_cache=update_cache, cache_name=cache_name)
-            hidden_states = (hidden_states.float()
-                             + attn_output * gate_msa).type_as(hidden_states)
+            hidden_states = RESIDUAL(hidden_states, attn_output, gate_msa)
 
             norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)
             attn_output = self.attn2(norm_hidden_states, encoder_hidden_states,
@@ -133,10 +138,10 @@ class HoistInvariantCasts:
             norm_hidden_states = (self.norm3(hidden_states.float()) * (1. + c_scale_msa)
                                   + c_shift_msa).type_as(hidden_states)
             ff_output = self.ffn(norm_hidden_states)
-            hidden_states = (hidden_states.float()
-                             + ff_output.float() * c_gate_msa).type_as(hidden_states)
+            hidden_states = RESIDUAL(hidden_states, ff_output, c_gate_msa)
             return hidden_states
 
+        blk_forward._iwm_calls_residual = True
         Blk.forward = blk_forward
         applied.append("modulation_constant_upcast")
 

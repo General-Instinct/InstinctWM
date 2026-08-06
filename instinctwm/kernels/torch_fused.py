@@ -49,9 +49,12 @@ def post_attn_gated_residual_fused(hidden, attn_out, gate):
 
 @torch.compile(dynamic=False, fullgraph=True)
 def _post_attn_exact_impl(hidden, attn_out, gate):
-    # Explicitly re-materialise the product in the storage dtype, reproducing the rounding the
-    # eager chain performs, then accumulate in fp32 exactly as eager does. This is what a
-    # BITEXACT fusion has to cost.
+    # Written to re-materialise the product in the storage dtype, on the belief that the eager
+    # chain rounds there. It does not -- `gate` is fp32, so eager keeps the product in fp32 (see
+    # the RE-CORRECTED note in `lingbot_regions.py`). So this variant adds a bf16 rounding eager
+    # never performs and is *further* from the reference than the plain fused one, which its
+    # measured max|d| = 7.8e-03 shows. Kept as the worked example of a kernel that is wrong in
+    # the direction everyone assumes is safe: reproducing a rounding that was not there.
     prod = (attn_out * gate).to(hidden.dtype)
     return (hidden.float() + prod.float()).type_as(hidden)
 
@@ -62,7 +65,8 @@ def _post_attn_exact_impl(hidden, attn_out, gate):
     preserves_intermediate_rounding=True,
     preserves_reduction_order=True,
     compute_dtype="fp32",
-    note="reproduces every eager rounding point explicitly; the price of BITEXACT")
+    note="rounds the product to bf16, which the fp32-gated reference does NOT do; kept as the "
+         "counter-example to 'more rounding is safer'")
 def post_attn_gated_residual_exact(hidden, attn_out, gate):
     return _post_attn_exact_impl(hidden, attn_out, gate)
 

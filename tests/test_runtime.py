@@ -42,7 +42,13 @@ def test_install_plan_applies_the_bitexact_substrate_passes():
     plan = Optimizer(tier_ceiling=Tier.BITEXACT).compile(model.spec())
     server = _FakeServerModule()
 
-    applied = install_plan(server, server.VA_Server, plan.without("conditioning_prefill"))
+    # Both dropped for the same reason: their installers patch the REAL `modules.model`, which a
+    # fake server module cannot stand in for. `operator_fusion` joined `default_passes()` after
+    # this test was written, so the default plan started carrying an installer that needs the
+    # lingbot tree and this test began failing on any box without it. It is named for the
+    # SUBSTRATE passes; a kernel pass is not one of them.
+    applied = install_plan(server, server.VA_Server,
+                           plan.without("conditioning_prefill", "operator_fusion"))
 
     assert "fsdp_elision" in applied
     assert "debug_dump_elision" in applied

@@ -182,9 +182,28 @@ class GraphBlockStack:
             for block in self_model.blocks:
                 block.attn1._iwm_commit(cache_name, key_size, update_cache)
 
+        def _eager(self_model, hidden, text, tproj, rot, update_cache, cache_name):
+            """The fallback path -- and it MUST still advance the ring.
+
+            `install` sets `_iwm_defer_commit = True` permanently, so `WanAttention.forward` no
+            longer commits inline; the only thing that advances the ring is `_commit_all`. Both
+            fallback returns used to skip it, which meant that from the first capture failure
+            onwards the ring FROZE: `count` stopped growing, every later forward rewrote the same
+            slots, and attention read a stale window. The actions stayed plausible and were
+            wrong.
+
+            Found by an OOM during a 50-task certification run, which is exactly how this fails
+            in production -- capture failure is advertised as a safe degradation, and this was
+            the one path where "safe" meant "silently incorrect". Nothing raises, nothing logs;
+            the only symptom is a task success rate that drifts.
+            """
+            out = _stack(self_model, hidden, text, tproj, rot, update_cache, cache_name)
+            _commit_all(self_model, hidden, update_cache, cache_name)
+            return out
+
         def stack_graphed(self_model, hidden, text, tproj, rot, update_cache, cache_name):
             if engine.failed:
-                return _stack(self_model, hidden, text, tproj, rot, update_cache, cache_name)
+                return _eager(self_model, hidden, text, tproj, rot, update_cache, cache_name)
             k = _key(self_model, hidden, tproj, update_cache, cache_name)
             if k not in engine.graphs:
                 try:
@@ -195,7 +214,7 @@ class GraphBlockStack:
                     if engine.verbose:
                         print(f"[graph_block_stack] CAPTURE FAILED, falling back to eager for the "
                               f"rest of the run: {engine.failed}", flush=True)
-                    return _stack(self_model, hidden, text, tproj, rot,
+                    return _eager(self_model, hidden, text, tproj, rot,
                                   update_cache, cache_name)
             else:
                 engine._touch(k)                     # LRU: recently used keys survive eviction

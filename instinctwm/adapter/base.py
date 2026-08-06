@@ -28,6 +28,10 @@ import enum
 from dataclasses import dataclass, field
 from typing import Mapping, Protocol, Sequence
 
+# `kernels.regions` is pure dataclasses — no torch, no registry — so importing it here keeps
+# `AdapterSpec` readable on a laptop. The kernel *implementations* stay behind the pass.
+from instinctwm.kernels.regions import FusionDescriptor
+
 
 class KVLifetime(enum.Enum):
     """How long a committed KV stream survives.
@@ -138,6 +142,14 @@ class AdapterSpec:
     #: WAMs surveyed agree the observation-decode tail is optional at serving time — Cosmos3-Edge
     #: denoises 550 of 567 tokens as future video and discards them.
     obs_decode_modules: tuple[str, ...] = ()
+    #: op sequences the adapter offers for fusion, read out of the model's source. A DECLARATION
+    #: of what the eager path does — which ops, in which order, materialising in which dtype —
+    #: and never a request to fuse. `OperatorFusion` decides whether any registered kernel is
+    #: legal for the declared structure, and `derive_tier` decides what claim it earns.
+    #:
+    #: Optional because it is the one declaration a model author cannot make from the config
+    #: alone: it needs the block source. An adapter that omits it simply gets no L5 pass.
+    fusion: FusionDescriptor | None = None
     notes: Mapping[str, str] = field(default_factory=dict)
 
     def phase(self, name: str) -> PhaseSpec:

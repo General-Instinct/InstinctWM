@@ -4,9 +4,10 @@ __pycache__/
 .venv/
 venv/
 
-# uv materialises the three environments here (.venv core, .venv-dev, .venv-server);
-# uv.lock IS committed -- it is the artifact that makes "the env that produced this
-# number" reconstructable.
+# uv materialises the environments here (.venv core, .venv-dev, .venv-server, and
+# .venv-omni for the external comparison arm); every lock IS committed -- uv.lock,
+# eval/lingbot_va_robotwin/server-requirements.txt and omni-arm-requirements.txt are
+# the artifacts that make "the env that produced this number" reconstructable.
 .venv-*/
 
 # Run artifacts live outside the repo (/home/ubuntu/iwm_*), but guard against
@@ -20,3 +21,6 @@ cycle_trace.json
 
 # Design docs stay local (not published)
 docs/
+
+# Claude Code session state and worktrees
+.claude/
